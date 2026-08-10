@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from autoware_auto_control_msgs.msg import AckermannControlCommand
+from autoware_control_msgs.msg import Control
 from autoware_auto_vehicle_msgs.msg import VelocityReport
 import sys
 import select
@@ -12,11 +12,17 @@ from datetime import datetime
 
 # Autoware Messages
 try:
-    from tier4_external_api_msgs.msg import Heartbeat, GearShiftStamped, GearShift, ControlCommandStamped
+    from tier4_external_api_msgs.msg import Heartbeat, GearShiftStamped, GearShift
     from tier4_external_api_msgs.srv import Engage
     HAS_TIER4 = True
 except ImportError:
     HAS_TIER4 = False
+
+try:
+    from autoware_adapi_v1_msgs.srv import ChangeOperationMode
+    HAS_ADAPI = True
+except ImportError:
+    HAS_ADAPI = False
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
@@ -92,20 +98,21 @@ class AckermannTeleop(Node):
             depth=1
         )
         
+        # Always use standard Control message directly to vehicle_cmd_gate
+        self.control_pub = self.create_publisher(Control, '/external/selected/control_cmd', qos_profile)
+        self.add_log("[green]Using standard Control -> /external/selected/control_cmd[/]")
+        
         if HAS_TIER4:
-            self.control_pub = self.create_publisher(ControlCommandStamped, '/api/external/set/command/remote/control', qos_profile)
             self.heartbeat_pub = self.create_publisher(Heartbeat, '/api/external/set/command/remote/heartbeat', 10)
             self.gear_pub = self.create_publisher(GearShiftStamped, '/api/external/set/command/remote/shift', 10)
             self.engage_client = self.create_client(Engage, '/api/autoware/set/engage')
-            try:
-                from autoware_adapi_v1_msgs.srv import ChangeOperationMode
-                self.remote_client = self.create_client(ChangeOperationMode, '/api/operation_mode/change_to_remote')
-                self.has_adapi = True
-            except ImportError:
-                self.has_adapi = False
+            
+        if HAS_ADAPI:
+            self.remote_client = self.create_client(ChangeOperationMode, '/api/operation_mode/change_to_remote')
+            self.local_client = self.create_client(ChangeOperationMode, '/api/operation_mode/change_to_local')
+            self.has_adapi = True
         else:
-            self.control_pub = self.create_publisher(AckermannControlCommand, '/control/command/control_cmd', qos_profile)
-            self.add_log("[yellow]Warning: HAS_TIER4 is False, using basic AckermannControlCommand[/]")
+            self.has_adapi = False
         
         # Velocity Status Subscriber
         self.vel_sub = self.create_subscription(
@@ -233,26 +240,33 @@ class AckermannTeleop(Node):
         status_text = "ENABLED" if self.enabled else "DISABLED"
         gear_str = "REVERSE" if self.target_velocity < 0.0 else "DRIVE"
         
-        header_text = Text(f"🚗 Autoware Ackermann Teleop Control | STATUS: [{status_text}] | GEAR: [{gear_str}]", justify="center")
+        header_text = Text(f"Autoware Ackermann Teleop Control | STATUS: [{status_text}] | GEAR: [{gear_str}]", justify="center")
         header_text.stylize(status_color, 49, 49 + len(status_text) + 2)
         self.layout["header"].update(Panel(header_text, style="white on blue" if self.enabled else "white on grey37"))
 
         # Body Left: Visual Bars (Command State)
         vel_norm = (self.target_velocity + self.max_velocity) / (2 * self.max_velocity)
-        vel_idx = max(0, min(20, int(vel_norm * 20)))
-        vel_arr = ['─'] * 21
-        vel_arr[10] = '┼'
-        vel_arr[vel_idx] = '█'
+        vel_idx = max(0, min(30, int(vel_norm * 30)))
+        vel_arr = ['─'] * 31
+        vel_arr[15] = '┼'
+        if vel_idx == 15:
+            vel_arr[vel_idx] = '┿'
+        else:
+            vel_arr[vel_idx] = '█'
         vel_str = "".join(vel_arr)
 
         throttle_bar = ProgressBar(total=1.0, completed=self.throttle_cmd, style="green", width=30)
         brake_bar = ProgressBar(total=1.0, completed=self.brake_cmd, style="red", width=30)
         
         s_norm = (self.steering + self.max_steering) / (2 * self.max_steering)
-        steer_idx = max(0, min(20, int(s_norm * 20)))
-        steer_arr = ['─'] * 21
-        steer_arr[10] = '┼'
-        steer_arr[steer_idx] = '█'
+        # Invert visual mapping: positive steering (left turn) moves block to the left
+        steer_idx = max(0, min(30, int((1.0 - s_norm) * 30)))
+        steer_arr = ['─'] * 31
+        steer_arr[15] = '┼'
+        if steer_idx == 15:
+            steer_arr[steer_idx] = '┿'
+        else:
+            steer_arr[steer_idx] = '█'
         steer_str = "".join(steer_arr)
 
         body_table = Table.grid(padding=(0, 2))
@@ -307,27 +321,35 @@ class AckermannTeleop(Node):
         return key
 
     def call_engage(self):
-        if not HAS_TIER4: return
-        self.add_log("Changing Operation Mode to REMOTE...")
-        if hasattr(self, 'has_adapi') and self.has_adapi:
-            from autoware_adapi_v1_msgs.srv import ChangeOperationMode
+        if getattr(self, 'has_adapi', False):
+            self.add_log("Changing Operation Mode to REMOTE...")
             req_remote = ChangeOperationMode.Request()
             self.remote_client.call_async(req_remote)
             
-        self.add_log("Calling Engage Service...")
-        req = Engage.Request()
-        req.engage = True
-        self.engage_client.call_async(req)
+        if HAS_TIER4:
+            self.add_log("Calling Engage Service...")
+            req = Engage.Request()
+            req.engage = True
+            self.engage_client.call_async(req)
+
+    def call_disengage(self):
+        if getattr(self, 'has_adapi', False):
+            self.add_log("Changing Operation Mode to LOCAL...")
+            req_local = ChangeOperationMode.Request()
+            self.local_client.call_async(req_local)
 
     def timer_callback(self):
         key = self.get_key()
         if key == ' ':
             self.enabled = not self.enabled
+            self.target_velocity = 0.0
+            self.steering = 0.0
             if self.enabled:
                 self.add_log("[bold green]System ENABLED and ENGAGED[/]")
                 self.call_engage()
             else:
-                self.add_log("[bold red]System DISABLED (Emergency Stop)[/]")
+                self.add_log("[bold yellow]System DISABLED (Returned to Local)[/]")
+                self.call_disengage()
         
         if key == 'w':
             self.target_velocity = min(self.max_velocity, self.target_velocity + self.velocity_step)
@@ -365,26 +387,23 @@ class AckermannTeleop(Node):
             
             gs = GearShiftStamped()
             gs.stamp = now
-            # Handle reverse gear logic
             if self.target_velocity < 0.0:
                 gs.gear_shift.data = GearShift.REVERSE
             else:
                 gs.gear_shift.data = GearShift.DRIVE
             self.gear_pub.publish(gs)
 
-            aw_cmd = ControlCommandStamped()
-            aw_cmd.stamp = now
-            aw_cmd.control.steering_angle = float(self.steering)
-            aw_cmd.control.throttle = float(self.throttle_cmd)
-            aw_cmd.control.brake = float(self.brake_cmd)
-            self.control_pub.publish(aw_cmd)
-        else:
-            cmd = AckermannControlCommand()
-            cmd.stamp = now
-            cmd.longitudinal.speed = float(self.target_velocity)
-            cmd.longitudinal.acceleration = float(self.throttle_cmd * 2.0)
-            cmd.lateral.steering_tire_angle = float(self.steering)
-            self.control_pub.publish(cmd)
+        # Publish Standard Control Command to External Selected Control
+        cmd = Control()
+        cmd.stamp = now
+        cmd.lateral.stamp = now
+        cmd.lateral.steering_tire_angle = float(self.steering)
+        
+        cmd.longitudinal.stamp = now
+        cmd.longitudinal.velocity = float(self.target_velocity)
+        cmd.longitudinal.acceleration = float(self.throttle_cmd * 2.0 - self.brake_cmd * 2.0)
+        cmd.longitudinal.is_defined_acceleration = True
+        self.control_pub.publish(cmd)
             
         self.update_layout()
         self.live.refresh()
