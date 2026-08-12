@@ -27,8 +27,8 @@ path_smoothing:
 # 4. MPC Optimization
 mpc:
   enable_gwo_tuning: true     # Allow external tuning (e.g. GWO)
-  prediction_horizon: 20       # N
-  prediction_dt: 0.1            # dt_ref [s]
+  prediction_horizon: 20       # N (Reduced to 20 for real-time <100ms execution!)
+  prediction_dt: 0.15          # dt_ref [s] (20 * 0.15 = 3.0s horizon)
   min_prediction_length: 5.0    # [m] (Adaptive horizon target)
   
   # Optimization Weights (Cost Function)
@@ -43,9 +43,9 @@ mpc:
     acceleration_input: 0.1  # accel
     
     # Input Rates (Smoothness)
-    steer_rate: 10.0        # weight_steer_rate
-    steer_acc: 10.0         # weight_steer_acc
-    lat_jerk: 1.0          # weight_lat_jerk
+    steer_rate: 500.0        # weight_steer_rate (Heavily penalize bang-bang steering)
+    accel_rate: 500.0        # Heavily penalize bang-bang acceleration
+    lat_jerk: 1.0            # weight_lat_jerk
 
   # Hard Constraints
   constraints:

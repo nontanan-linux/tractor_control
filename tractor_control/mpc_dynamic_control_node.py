@@ -22,6 +22,9 @@ import casadi as ca
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
+# Import the new debug logger
+from tractor_control.mpc_logger import MPCDebugLogger
+
 class MPCDynamicController:
     def __init__(self, config):
         self.config = config
@@ -203,7 +206,7 @@ class MPCDynamicController:
         r_steer = self.config['mpc']['weights']['steering_input']
         r_accel = self.config['mpc']['weights']['acceleration_input']
         rd_steer = self.config['mpc']['weights']['steer_rate']
-        rd_accel = self.config['mpc']['weights'].get('steer_acc', 10.0)
+        rd_accel = self.config['mpc']['weights'].get('accel_rate', 100.0)
 
         obj = 0
         for k in range(self.N):
@@ -223,9 +226,12 @@ class MPCDynamicController:
             if k == 0:
                 obj += rd_steer * (self.U[0, k] - self.u_prev[0])**2
                 obj += rd_accel * (self.U[1, k] - self.u_prev[1])**2
-            else:
-                obj += rd_steer * (self.U[0, k] - self.U[0, k-1])**2
-                obj += rd_accel * (self.U[1, k] - self.U[1, k-1])**2
+            if k > 0:
+                # Normalize rate penalties to a base dt of 0.1 to match user's tuning scale!
+                # If dt changes, this perfectly cancels out the (dU)^2 time-scaling effect.
+                dt_scale = (0.1 / self.dt)**2
+                obj += (rd_steer * dt_scale) * (self.U[0, k] - self.U[0, k-1])**2
+                obj += (rd_accel * dt_scale) * (self.U[1, k] - self.U[1, k-1])**2
                 
             # 1. Implicit Dynamics Formulation (Backward Euler for absolute stability!)
             # Evaluate forces at k+1 to make the integration unconditionally stable
@@ -254,7 +260,7 @@ class MPCDynamicController:
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
-            'ipopt.max_iter': 100,      # Reduced to prevent hanging!
+            'ipopt.max_iter': 300,      # Increased to allow convergence for longer horizons!
             'ipopt.tol': 1e-1, 
             'ipopt.acceptable_tol': 5e-1,
             'ipopt.acceptable_iter': 5,
@@ -315,12 +321,14 @@ class MPCDynamicController:
             self.solve_success = False
             self.last_error_msg = str(e)
             try:
-                # Attempt to get more debug info but don't crash
-                self.opti.debug.show_infeasibilities(1e-5)
+                # --- CRITICAL FIX: Prevent Control Lockups! ---
+                # If IPOPT fails (e.g. max iterations reached), we MUST NOT freeze!
+                # Using the suboptimal guess is infinitely better than locking the steering!
+                sub_X = self.opti.debug.value(self.X)
+                sub_U = self.opti.debug.value(self.U)
+                return sub_U[:, 0], sub_X
             except:
-                pass
-            # Return previous input on failure, X_pred = None triggers warning
-            return u_prev, None
+                return u_prev, None
 
 class MPCDynamicControlNode(Node):
     def __init__(self):
@@ -360,6 +368,13 @@ class MPCDynamicControlNode(Node):
         
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.heartbeat_timer = self.create_timer(0.5, self.publish_heartbeat)
+        
+        # Initialize Debug Logger
+        # This will create a new CSV file in the tractor_control/debug folder
+        # and prevent using old values by keeping fresh logs.
+        debug_dir = os.path.expanduser("~/AutoTract/tractor_ws/src/control/tractor_control/debug")
+        self.csv_logger = MPCDebugLogger(log_dir=debug_dir)
+        self.get_logger().info(f"MPC Debug Logger initialized. Saving to: {self.csv_logger.filename}")
         
         self.get_logger().info("Dynamic 5-DOF MPC Node Started")
 
@@ -435,12 +450,62 @@ class MPCDynamicControlNode(Node):
         dists = [(p.pose.position.x - self.current_state[0])**2 + (p.pose.position.y - self.current_state[1])**2 for p in self.full_ref_points]
         idx = np.argmin(dists)
         
+        # --- Prevent the "Rabbit" from starting behind the vehicle! ---
+        # If the closest point is physically behind the rear axle, the Euclidean penalty
+        # will command the vehicle to brake/reverse! We must pick the next point ahead.
+        while idx < len(self.full_ref_points) - 1:
+            p = self.full_ref_points[idx]
+            yaw = self.current_state[2]
+            dx = p.pose.position.x - self.current_state[0]
+            dy = p.pose.position.y - self.current_state[1]
+            # Dot product to check if point is behind vehicle heading
+            if dx * math.cos(yaw) + dy * math.sin(yaw) < 0:
+                idx += 1
+            else:
+                break
+        # --------------------------------------------------------------
+        
+        # --- Goal Tolerance & Auto-Disable Logic ---
+        final_p = self.full_ref_points[-1]
+        dist_to_goal = math.hypot(final_p.pose.position.x - self.current_state[0], final_p.pose.position.y - self.current_state[1])
+        
+        # Calculate heading error to final point
+        q = final_p.pose.orientation
+        final_yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y**2 + q.z**2))
+        yaw_diff = (self.current_state[2] - final_yaw + math.pi) % (2 * math.pi) - math.pi
+        yaw_error = abs(yaw_diff)
+        
+        goal_tolerance = 0.5     # [meters]
+        heading_tolerance = 0.3  # [rad] (~17 degrees) Relaxed to prevent reversing!
+        
+        if dist_to_goal < goal_tolerance and yaw_error < heading_tolerance and final_p.longitudinal_velocity_mps == 0.0:
+            # We reached the goal! Avoid singular solver at v=0 by stopping explicitly.
+            if self.enabled:
+                self.get_logger().info("Reached goal destination! Disabling MPC and stopping vehicle.")
+                if self.engage_client.wait_for_service(timeout_sec=0.1):
+                    req = Engage.Request()
+                    req.engage = False
+                    self.engage_client.call_async(req)
+                self.enabled = False
+            
+            # Send Stop Command
+            cmd = Control()
+            cmd.stamp = self.get_clock().now().to_msg()
+            cmd.lateral.stamp = cmd.stamp
+            cmd.longitudinal.stamp = cmd.stamp
+            cmd.lateral.steering_tire_angle = float(self.u_prev[0])
+            cmd.longitudinal.velocity = 0.0
+            cmd.longitudinal.acceleration = -1.0
+            self.control_pub.publish(cmd)
+            return
+        # --------------------------------------------
+        
         N = self.controller.N
         ref_traj = np.zeros((3, N + 1))
         v_ref = np.zeros((1, N + 1))
         
-        # Build local path arc length
-        path_len = min(100, len(self.full_ref_points) - idx)
+        # Build local path arc length (Expanded to 300 points to ensure the prediction horizon doesn't hit a wall)
+        path_len = min(300, len(self.full_ref_points) - idx)
         local_points = self.full_ref_points[idx:idx+path_len]
         arc = [0.0]
         for i in range(1, len(local_points)):
@@ -482,14 +547,19 @@ class MPCDynamicControlNode(Node):
             # Advance spatial reference using the ACTUAL velocity reference!
             s_ref += p.longitudinal_velocity_mps * dt
             
-        # Use ACTUAL steering angle for the rate penalty! This prevents huge oscillations.
-        if hasattr(self, 'actual_steer'):
+        # Only use actual_steer if it's actually updating (not dead at 0.0)!
+        # Otherwise, trust our last command to maintain rate continuity.
+        if hasattr(self, 'actual_steer') and abs(self.actual_steer) > 0.001:
             self.u_prev[0] = self.actual_steer
             
+        import time
+        start_solve = time.time()
         u_opt, x_pred = self.controller.solve(self.current_state, ref_traj, v_ref, self.u_prev)
+        solve_time_ms = (time.time() - start_solve) * 1000.0
         
         if x_pred is not None:
-            self.u_prev[1] = u_opt[1] # Keep accel, but steer is updated by feedback
+            self.u_prev[0] = u_opt[0] # MUST update prev steer to maintain continuity!
+            self.u_prev[1] = u_opt[1] # Keep accel
             self.current_state[3] = x_pred[3, 1]
             self.current_state[4] = x_pred[4, 1]
             self.current_state[8] = x_pred[8, 1]
@@ -519,6 +589,41 @@ class MPCDynamicControlNode(Node):
                 
             cmd.longitudinal.acceleration = float(u_opt[1])
             cmd.longitudinal.is_defined_acceleration = True
+            
+            # --- Log Data to CSV ---
+            try:
+                # Extract starting point from the trajectory (used by MPC)
+                start_p = self.full_ref_points[idx]
+                start_coords = (start_p.pose.position.x, start_p.pose.position.y)
+                goal_coords = (final_p.pose.position.x, final_p.pose.position.y)
+                
+                # reference at k=0
+                ref_0 = (ref_traj[0, 0], ref_traj[1, 0], ref_traj[2, 0], v_ref[0, 0])
+                
+                # cmd
+                cmd_data = (cmd.lateral.steering_tire_angle, cmd.longitudinal.acceleration, cmd.longitudinal.velocity)
+                
+                # feedback
+                fb_data = (
+                    self.current_state[0], self.current_state[1], self.current_state[2], 
+                    self.current_state[5], self.current_state[6], self.current_state[7], 
+                    self.actual_steer
+                )
+                
+                # Log step
+                self.csv_logger.log_step(
+                    ts=cmd.stamp.sec + cmd.stamp.nanosec * 1e-9,
+                    start=start_coords,
+                    goal=goal_coords,
+                    ref_traj=ref_0,
+                    cmd=cmd_data,
+                    fb=fb_data,
+                    solve_time_ms=solve_time_ms,
+                    dist_to_goal=dist_to_goal
+                )
+            except Exception as e:
+                self.get_logger().error(f"Failed to log CSV: {e}")
+            # -----------------------
             
             if x_pred is not None:
                 path = Path()
