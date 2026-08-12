@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 import os
 from glob import glob
 
-package_name = 'tracter_control'
+package_name = 'tractor_control'
 
 setup(
     name=package_name,
@@ -28,10 +28,11 @@ setup(
             'mpc_node = simulation.mpc_node:main',
             'gwo_tuner_node = simulation.gwo_tuner_node:main',
             'path_publisher_node = simulation.path_publisher:main',
-            'vehicle_node = tracter_control.vehicle_node:main',
-            'nmpc_control_node = tracter_control.nmpc_control_node:main',
-            'ackermann_teleop_node = tracter_control.ackermann_teleop_node:main',
-            'tracter_control_node = tracter_control.tracter_control:main',
+            'vehicle_node = tractor_control.vehicle_node:main',
+            'nmpc_control_node = tractor_control.nmpc_control_node:main',
+            'mpc_dynamic_control_node = tractor_control.mpc_dynamic_control_node:main',
+            'ackermann_teleop_node = tractor_control.ackermann_teleop_node:main',
+            'tractor_control_node = tractor_control.tracter_control:main',
         ],
     },
 )

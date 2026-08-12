@@ -34,18 +34,18 @@ mpc:
   # Optimization Weights (Cost Function)
   weights:
     # State Errors (Q matrix)
-    lat_error: 5.0          # e_y
-    heading_error: 5.0      # e_theta
-    velocity_error: 30.0     # e_v (Increased to encourage movement)
+    lat_error: 100.0          # e_y
+    heading_error: 50.0      # e_theta
+    velocity_error: 10.0     # e_v
     
     # Input Magnitudes (R matrix)
-    steering_input: 10.0     # delta_diff
-    acceleration_input: 0.1  # accel (Reduced to allow more acceleration)
+    steering_input: 1.0     # delta_diff
+    acceleration_input: 0.1  # accel
     
     # Input Rates (Smoothness)
-    steer_rate: 50.0        # weight_steer_rate
-    steer_acc: 10.0         # weight_steer_acc (Reduced significantly to allow accel change)
-    lat_jerk: 10.0          # weight_lat_jerk (Proxy via steer rate * v)
+    steer_rate: 10.0        # weight_steer_rate
+    steer_acc: 10.0         # weight_steer_acc
+    lat_jerk: 1.0          # weight_lat_jerk
 
   # Hard Constraints
   constraints:
